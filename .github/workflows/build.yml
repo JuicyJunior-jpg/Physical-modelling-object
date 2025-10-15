@@ -1,0 +1,49 @@
+name: build-juicy-physical-synth
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main, master ]
+    paths:
+      - "juicy_physical_synth_tilde.c"
+      - "Makefile"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y puredata-dev build-essential
+      - name: Build (Linux)
+        run: make linux
+      - name: Upload artifact (Linux)
+        uses: actions/upload-artifact@v4
+        with:
+          name: juicy_physical_synth_linux
+          path: juicy_physical_synth~.pd_linux
+
+  macos_arm64:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Fetch Pd headers (vanilla 0.56-1)
+        run: |
+          curl -L https://msp.ucsd.edu/Software/pd-0.56-1.src.tar.gz -o pd-src.tgz
+          tar xf pd-src.tgz
+          echo "PD_SRC=$(pwd)/pd-0.56-1/src" >> $GITHUB_ENV
+      - name: Force arm64-only build flags
+        run: |
+          # Replace the mac rule to use arm64 only (universal builds are flaky on arm runners)
+          sed -i.bak 's/-arch arm64 -arch x86_64/-arch arm64/g' Makefile
+      - name: Build (macOS arm64)
+        run: make mac PD_SRC_MAC=${{ env.PD_SRC }}
+      - name: Upload artifact (macOS arm64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: juicy_physical_synth_macos_arm64
+          path: juicy_physical_synth~.pd_darwin
