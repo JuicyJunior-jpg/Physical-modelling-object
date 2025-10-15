@@ -37,7 +37,7 @@ jobs:
           tar xf pd-src.tgz
           echo "PD_SRC=$(pwd)/pd-0.56-1/src" >> $GITHUB_ENV
       - name: Build (macOS x86_64)
-        run: make mac_x86 PD_SRC_MAC=${{ env.PD_SRC }}
+        run: make mac_x86 PD_SRC_MAC="${{ env.PD_SRC }}"
       - name: Upload artifact (macOS x86_64)
         uses: actions/upload-artifact@v4
         with:
