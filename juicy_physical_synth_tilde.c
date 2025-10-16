@@ -1,466 +1,485 @@
-// juicy_physical_synth_tilde.c (HOTFIX)
-// Stability-focused update: removes risky code paths and adds hard guards.
-//  - Stable AR env
-//  - Non-null buffers from new()
-//  - Defensive allocation in dsp() and perform()
-//  - NaN/Inf clamps
-//  - Safe delay sizing and filter coeffs
+
+// juicy_physical_synth~.c
+// “Ultimate” wrapper that embeds juicy_bank~ (modal) + wg_bank~ (waveguide)
+// and mixes/routs them inside ONE DSP perform loop.
+// Design note: we INCLUDE the original .c files so their static helpers/types
+// are available. We DO NOT call their Pd setup() or new() methods. Instead we
+// allocate their state structs directly and drive their static perform()
+// functions with our own input/output vectors.
+//
+// IMPORTANT: Keep the two source files next to this one with the exact names:
+//   - "juicy_bank_tilde (pre-connection).c"
+//   - "wg_bank_tilde (pre-connection).c"
+//
+// Build targets are provided in the Makefile.
+//
+// Inlets/Outlets (signals):
+//   ~ 8 signal inlets: exciter audio per voice (v1_L, v1_R, … v4_L, v4_R).
+//   ~ 2 signal outlets: L/R mix of Modal + Waveguide engines.
+//
+// Message inlets (float proxies):
+//   inlet #9  (float): Modal params (damper/brightness/…/keytrack) — send as "symbol float".
+//   inlet #10 (float): Waveguide params (index/gain/…/symmetry + MSD block).
+//   inlet #11 (float): Global params (Modal_gain/Waveguide_gain/Waveguide_excitation_crossfader).
+//   inlet #12 (list) : Poly voice list exactly like wg_bank~/juicy_bank~ expect (midi/vel, etc.).
+//
+// Crossfader: -1..1 (constant-power). -1 = pure external exciter → WG, +1 = modal stereo → WG.
+// Per-voice gating: WG only ingests when that voice is active (per modal’s voice state).
+//
+// SAFETY: This file never registers the juicy_bank~ or wg_bank~ Pd classes, so it
+// won’t conflict with separate externals you might load. We only use their internals.
+//
+// © You + Juicy 2025. MIT-ish vibes.
+
 #include "m_pd.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
-#define JPS_VOICES 4
-#define JPS_SIG_INLETS (JPS_VOICES*2)
-#define JPS_MODAL_MAXMODES 64
-#define JPS_MIN_BLOCK 16
+// ---- prevent registering the embedded classes ----
+#define juicy_bank_tilde_setup juicy_bank_tilde_setup__embedded__do_not_call
+#define wg_bank_tilde_setup    wg_bank_tilde_setup__embedded__do_not_call
 
-static inline float jps_clamp(float x, float lo, float hi){ return (x<lo?lo:(x>hi?hi:x)); }
-static inline float jps_clamp01(float v){ return v<0.f?0.f:(v>1.f?1.f:v); }
-static inline float jps_midi_to_hz(float n){ return 440.f * powf(2.f, (n-69.f)/12.f); }
-static inline float jps_cospow_w(float t){ t=jps_clamp01(t); return sqrtf(1.f - t); }
-static inline float jps_cospow_u(float t){ t=jps_clamp01(t); return sqrtf(t); }
-static inline float jps_safenan(float x){ return (isfinite(x)? x : 0.f); }
+// Include engines (as provided). Paths with spaces are OK when in quotes.
+#include "juicy_bank_tilde (pre-connection).c"
+#include "wg_bank_tilde (pre-connection).c"
 
-typedef enum { JPS_IDLE=0, JPS_HELD=1, JPS_RELEASE=2 } jps_vstate;
-typedef struct { jps_vstate state; float f0, vel; } jps_voice_t;
-
-typedef struct { float z; } jps_onepole;
-static inline float onepole_a_from_hz(float hz, float sr){
-    if(hz<=0.f) return 0.0f;
-    float a = expf(-2.f*M_PI * (hz/sr));
-    if(!(a>=0.f && a<1.f)) a = 0.0f;
-    return a;
-}
-static inline float onepole_lp(float x, jps_onepole* st, float a){
-    float y = (1.f-a)*x + a*st->z; st->z = y; return y;
-}
-static inline float onepole_hp(float x, jps_onepole* st, float a){
-    float y = x - onepole_lp(x, st, a); return y;
-}
-
-typedef struct { float z; } jps_allpass;
-static inline float allpass_tick(float x, jps_allpass* st, float g){
-    g = jps_clamp(g, -0.98f, 0.98f);
-    float y = -g*x + st->z;
-    st->z = x + g*y;
-    return y;
-}
-
-static inline float waveshape(float x, float drive, float symmetry){
-    float bias = jps_clamp(symmetry, -1.f, 1.f) * 0.9f;
-    x = jps_safenan(x + bias);
-    drive = jps_clamp01(drive);
-    float y;
-    if(drive <= 0.5f){
-        float t = drive/0.5f;
-        float soft = tanhf(x);
-        y = soft*t + (1.f-t)*x;
-    }else{
-        float t = (drive-0.5f)/0.5f;
-        float hard = (x>1.f?1.f:(x<-1.f?-1.f:x));
-        float soft = tanhf(x);
-        y = hard*t + (1.f-t)*soft;
-    }
-    y -= bias * 0.5f;
-    return jps_safenan(y);
-}
-
-// ===== MODAL =====
-typedef struct {
-    float damper, brightness, position, density, dispersion, anisotropy, contact;
-    int   index;
-    float ratio[JPS_MODAL_MAXMODES], gain[JPS_MODAL_MAXMODES], attack[JPS_MODAL_MAXMODES], decay[JPS_MODAL_MAXMODES];
-    float curve[JPS_MODAL_MAXMODES], pan[JPS_MODAL_MAXMODES], keytrack[JPS_MODAL_MAXMODES];
-    int   modes;
-    float env[JPS_VOICES][JPS_MODAL_MAXMODES];
-    float ph[JPS_VOICES][JPS_MODAL_MAXMODES];
-    int   gate[JPS_VOICES];
-} jps_modal;
-
-typedef struct {
-    int   index;
-    float gain, ratio, keytrack, polarity, decay, release, HP, LP;
-    float dispersion, position, coupling, push, drive, symmetry;
-    float msd_AMT, msd_Freq, msd_Q, msd_INDEX, msd_TILT, msd_Enable, msd_EM;
-    // simple delay per voice/channel
-    float **bufL, **bufR;
-    int   *size, *wpos;
-    jps_onepole *hpL, *hpR, *lpL, *lpR;
-    jps_allpass *apL, *apR;
-} jps_wg;
+// ===============================
+// Wrapper object
+// ===============================
 
 typedef struct _jps {
     t_object  x_obj;
-    t_inlet  *in_sig[JPS_SIG_INLETS];
     t_outlet *outL, *outR;
-    struct _jps_proxy *proxy_modal, *proxy_wg, *proxy_global;
 
-    int sr, bs;
-    jps_voice_t V[JPS_VOICES];
-    jps_modal modal;
-    jps_wg    wg;
+    // Embedded engine states
+    t_juicy_bank_tilde modal;
+    t_wg_bank          wg;
 
-    float g_modal_gain, g_wg_gain, g_wg_xfade;
+    // Globals
+    t_float modal_gain;   // 0..1
+    t_float wg_gain;      // 0..1
+    t_float cf;           // -1..1 crossfade (ext exciter ↔ modal stereo)
 
-    // per-voice modal feed & sums
-    float **mod_vL, **mod_vR;
-    float *modal_sumL, *modal_sumR;
-    float *wg_sumL, *wg_sumR;
+    // scratch buffers reused per block
+    int      bs_cached;
+    t_float *zilch;       // zero vector (for unused inputs)
+    t_float *modalL, *modalR;
+    t_float *wgL, *wgR;
+    // per-voice crossfade inputs for WG
+    t_float *sL[WG_VOICES*2]; // we’ll reuse pointers into exciter inputs
+    t_float *sR[WG_VOICES*2];
 
-    t_sample *excL[JPS_VOICES], *excR[JPS_VOICES];
+    // proxies to route messages
+    t_symbol *which_modal;
+    t_symbol *which_wg;
+    t_symbol *which_glob;
 } t_jps;
 
-typedef struct _jps_proxy { t_object p_obj; t_jps *owner; int which; } t_jps_proxy;
 static t_class *jps_class;
-static t_class *jps_proxy_class;
 
-static void modal_init(jps_modal* m){
-    m->damper=0.5f; m->brightness=0.5f; m->position=0.f; m->density=0.f; m->dispersion=0.f; m->anisotropy=0.f; m->contact=0.f;
-    m->index=0; m->modes=1;
-    for(int i=0;i<JPS_MODAL_MAXMODES;i++){
-        m->ratio[i]=(i==0)?1.f:(float)(i+1);
-        m->gain[i]=(i==0)?1.f:(1.f/(1.f+i));
-        m->attack[i]=5.f; m->decay[i]=400.f;
-        m->curve[i]=0.f; m->pan[i]=0.f; m->keytrack[i]=1.f;
+// -------------------------------
+// Small helpers
+// -------------------------------
+
+static inline void *jps_alloc_zero(size_t count){
+    t_float *p = (t_float *)getbytes(count * sizeof(t_float));
+    if(p) memset(p, 0, count*sizeof(t_float));
+    return p;
+}
+
+static inline void jps_ensure_buffers(t_jps *x, int bs){
+    if (x->bs_cached == bs && x->zilch) return;
+    if (x->zilch){
+        freebytes(x->zilch, x->bs_cached*sizeof(t_float));
+        freebytes(x->modalL, x->bs_cached*sizeof(t_float));
+        freebytes(x->modalR, x->bs_cached*sizeof(t_float));
+        freebytes(x->wgL,    x->bs_cached*sizeof(t_float));
+        freebytes(x->wgR,    x->bs_cached*sizeof(t_float));
     }
-    memset(m->env,0,sizeof(m->env));
-    memset(m->ph,0,sizeof(m->ph));
-    memset(m->gate,0,sizeof(m->gate));
-}
-static void wg_alloc_structs(jps_wg* w){
-    w->bufL = (float**)calloc(JPS_VOICES,sizeof(float*));
-    w->bufR = (float**)calloc(JPS_VOICES,sizeof(float*));
-    w->size = (int*)calloc(JPS_VOICES,sizeof(int));
-    w->wpos = (int*)calloc(JPS_VOICES,sizeof(int));
-    w->hpL = (jps_onepole*)calloc(JPS_VOICES,sizeof(jps_onepole));
-    w->hpR = (jps_onepole*)calloc(JPS_VOICES,sizeof(jps_onepole));
-    w->lpL = (jps_onepole*)calloc(JPS_VOICES,sizeof(jps_onepole));
-    w->lpR = (jps_onepole*)calloc(JPS_VOICES,sizeof(jps_onepole));
-    w->apL = (jps_allpass*)calloc(JPS_VOICES,sizeof(jps_allpass));
-    w->apR = (jps_allpass*)calloc(JPS_VOICES,sizeof(jps_allpass));
-}
-static void wg_init(jps_wg* w){
-    w->index=0; w->gain=1.f; w->ratio=1.f; w->keytrack=1.f; w->polarity=+1.f;
-    w->decay=1.f; w->release=1.f; w->HP=0.f; w->LP=0.f;
-    w->dispersion=0.f; w->position=0.f; w->coupling=0.f; w->push=0.f; w->drive=0.f; w->symmetry=0.f;
-    w->msd_AMT=0.f; w->msd_Freq=0.f; w->msd_Q=1.f; w->msd_INDEX=0.f; w->msd_TILT=0.f; w->msd_Enable=0.f; w->msd_EM=0.f;
-    wg_alloc_structs(w);
+    x->zilch  = (t_float*)jps_alloc_zero(bs);
+    x->modalL = (t_float*)jps_alloc_zero(bs);
+    x->modalR = (t_float*)jps_alloc_zero(bs);
+    x->wgL    = (t_float*)jps_alloc_zero(bs);
+    x->wgR    = (t_float*)jps_alloc_zero(bs);
+    x->bs_cached = bs;
 }
 
-static int get1f(int argc, t_atom* argv, float* out){
-    if(argc<1 || argv[0].a_type!=A_FLOAT) return 0;
-    *out = atom_getfloat(argv); return 1;
+// Constant-power crossfade gains from c ∈ [-1,1] (A = ext, B = modal)
+static inline void jps_cf_gains(float c, float *gA, float *gB){
+    float p = 0.5f * (c + 1.f);              // map to [0,1]
+    float a = cosf((float)M_PI_2 * p);
+    float b = sinf((float)M_PI_2 * p);
+    *gA = a; *gB = b;
 }
 
-static void jps_list(t_jps* x, t_symbol* s, int argc, t_atom* argv){
+// -------------------------------
+// Parameter routing (subset/aliases)
+// -------------------------------
+
+// Modal body params
+static void jps_modal_param(t_jps *x, t_symbol *s, t_float f){
+    // aliases: "damper" → damping, "decay" → decya
+    if (s==gensym("damper") || s==gensym("damping"))        { juicy_bank_tilde_damping(&x->modal, f); return; }
+    if (s==gensym("brightness"))                            { juicy_bank_tilde_brightness(&x->modal, f); return; }
+    if (s==gensym("position"))                              { juicy_bank_tilde_position(&x->modal, f); return; }
+    if (s==gensym("density"))                               { juicy_bank_tilde_density(&x->modal, f); return; }
+    if (s==gensym("dispersion"))                            { juicy_bank_tilde_dispersion(&x->modal, f); return; }
+    if (s==gensym("anisotropy") || s==gensym("aniso"))      { juicy_bank_tilde_anisotropy(&x->modal, f); return; }
+    if (s==gensym("contact"))                               { juicy_bank_tilde_contact(&x->modal, f); return; }
+
+    if (s==gensym("index"))                                 { juicy_bank_tilde_index(&x->modal, f); return; }
+    if (s==gensym("ratio"))                                 { juicy_bank_tilde_ratio(&x->modal, f); return; }
+    if (s==gensym("gain"))                                  { juicy_bank_tilde_gain(&x->modal, f); return; }
+    if (s==gensym("attack"))                                { juicy_bank_tilde_attack(&x->modal, f); return; }
+    if (s==gensym("decay") || s==gensym("decya"))           { juicy_bank_tilde_decya(&x->modal, f); return; }
+    if (s==gensym("curve"))                                 { juicy_bank_tilde_curve(&x->modal, f); return; }
+    if (s==gensym("pan"))                                   { juicy_bank_tilde_pan(&x->modal, f); return; }
+    if (s==gensym("keytrack"))                              { juicy_bank_tilde_keytrack(&x->modal, f); return; }
+}
+
+// Waveguide params (string topology only)
+static void jps_wg_param(t_jps *x, t_symbol *s, t_float f){
+    if (s==gensym("index"))     { x->wg.v_index = x->wg.index  = f; return; }
+    if (s==gensym("gain"))      { x->wg.v_gain  = x->wg.gain   = f; return; }
+    if (s==gensym("ratio"))     { x->wg.v_ratio = x->wg.ratio  = f; return; }
+    if (s==gensym("keytrack"))  { /* handled via proxies in wg normally; noop here */ return; }
+    if (s==gensym("polarity"))  { /* plus(>0)/minus(<=0) */ for(int v=0; v<VOICES; ++v){ x->wg.V[v].L[x->wg.active_idx].polarity_plus = (f>0.f)?1:0; } return; }
+
+    if (s==gensym("decay"))     { x->wg.v_decay   = x->wg.decay   = f; return; }
+    if (s==gensym("release"))   { x->wg.v_release = x->wg.release = f; return; }
+    if (s==gensym("HP"))        { x->wg.v_hp      = x->wg.hp      = f; return; }
+    if (s==gensym("LP"))        { x->wg.v_lp      = x->wg.lp      = f; return; }
+    if (s==gensym("dispersion")){ x->wg.v_disp    = x->wg.disp    = f; return; }
+    if (s==gensym("position"))  { x->wg.v_pos     = x->wg.pos     = f; return; }
+    if (s==gensym("coupling"))  { x->wg.v_coupling= x->wg.coupling= f; return; }
+    if (s==gensym("push"))      { x->wg.v_push    = x->wg.push    = f; return; }
+    if (s==gensym("drive"))     { x->wg.v_drive   = x->wg.drive   = f; return; }
+    if (s==gensym("symmetry"))  { x->wg.v_bias    = x->wg.bias    = f; return; }
+
+    // MSD
+    if (s==gensym("AMT"))       { x->wg.v_msd_amt  = x->wg.msd_amt  = f; return; }
+    if (s==gensym("Freq"))      { x->wg.v_msd_freq = x->wg.msd_freq = f; return; }
+    if (s==gensym("Q"))         { x->wg.v_msd_q    = x->wg.msd_q    = f; return; }
+    if (s==gensym("INDEX"))     { x->wg.v_msd_pos  = x->wg.msd_pos  = f; return; }
+    if (s==gensym("TILT"))      { x->wg.v_edge     = x->wg.edge     = f; return; }
+    if (s==gensym("Enable"))    { x->wg.v_msd_enable = x->wg.msd_enable = (f>0.f)?1:0; return; }
+    if (s==gensym("E/M"))       { /* not present in current wg core; ignore gracefully */ return; }
+}
+
+// Globals
+static void jps_global_param(t_jps *x, t_symbol *s, t_float f){
+    if (s==gensym("Modal_gain"))                         { x->modal_gain = f; return; }
+    if (s==gensym("Waveguide_gain"))                     { x->wg_gain    = f; return; }
+    if (s==gensym("Waveguide_excitation_crossfader"))    { x->cf = f;    return; }
+}
+
+// -------------------------------
+// Voice list (shared to both engines)
+// Expect exact grammar those banks use; we forward to their helpers.
+// -------------------------------
+
+static void jps_list(t_jps *x, t_symbol *s, int argc, t_atom *argv){
     (void)s;
-    if(argc<3) return;
-    if(argv[0].a_type!=A_FLOAT || argv[1].a_type!=A_FLOAT || argv[2].a_type!=A_FLOAT) return;
-    int vix = (int)atom_getfloat(argv) - 1;
-    float midi = atom_getfloat(argv+1);
-    float vel  = atom_getfloat(argv+2);
-    if(vix<0 || vix>=JPS_VOICES) return;
-    if(vel>0.f){
-        x->V[vix].state=JPS_HELD;
-        x->V[vix].f0=jps_midi_to_hz(midi);
-        x->V[vix].vel=jps_clamp01(vel);
-        x->modal.gate[vix]=1;
-        for(int k=0;k<x->modal.modes;k++){ x->modal.env[vix][k]=0.f; }
-    }else{
-        x->V[vix].state=JPS_RELEASE;
-        x->modal.gate[vix]=0;
-    }
-}
-static void jps_modal_msg(t_jps* x, t_symbol* sel, int argc, t_atom* argv){
-    float v;
-    #define SET(sym,field) if(sel==gensym(sym) && get1f(argc,argv,&v)){ x->modal.field=v; return; }
-    SET("damper",damper) SET("brightness",brightness) SET("position",position) SET("density",density)
-    SET("dispersion",dispersion) SET("anisotropy",anisotropy) SET("contact",contact)
-    if(sel==gensym("index") && get1f(argc,argv,&v)){ int i=(int)v; if(i<0)i=0; if(i>=JPS_MODAL_MAXMODES)i=JPS_MODAL_MAXMODES-1; x->modal.index=i; return; }
-    if(sel==gensym("ratio")   && get1f(argc,argv,&v)){ x->modal.ratio[x->modal.index]=v; return; }
-    if(sel==gensym("gain")    && get1f(argc,argv,&v)){ x->modal.gain[x->modal.index]=v; return; }
-    if(sel==gensym("attack")  && get1f(argc,argv,&v)){ x->modal.attack[x->modal.index]=v; return; }
-    if(sel==gensym("decay")   && get1f(argc,argv,&v)){ x->modal.decay[x->modal.index]=v; return; }
-    if(sel==gensym("curve")   && get1f(argc,argv,&v)){ x->modal.curve[x->modal.index]=v; return; }
-    if(sel==gensym("pan")     && get1f(argc,argv,&v)){ x->modal.pan[x->modal.index]=v; return; }
-    if(sel==gensym("keytrack")&& get1f(argc,argv,&v)){ x->modal.keytrack[x->modal.index]=v; return; }
-    #undef SET
-}
-static void jps_wg_msg(t_jps* x, t_symbol* sel, int argc, t_atom* argv){
-    float v;
-    #define SET(sym,field) if(sel==gensym(sym) && get1f(argc,argv,&v)){ x->wg.field=v; return; }
-    SET("index",index) SET("gain",gain) SET("ratio",ratio) SET("keytrack",keytrack) SET("polarity",polarity)
-    SET("decay",decay) SET("release",release) SET("HP",HP) SET("LP",LP) SET("dispersion",dispersion)
-    SET("position",position) SET("coupling",coupling) SET("push",push) SET("drive",drive) SET("symmetry",symmetry)
-    SET("AMT",msd_AMT) SET("Freq",msd_Freq) SET("Q",msd_Q) SET("INDEX",msd_INDEX) SET("TILT",msd_TILT) SET("Enable",msd_Enable) SET("E/M",msd_EM)
-    #undef SET
-}
-static void jps_global_msg(t_jps* x, t_symbol* sel, int argc, t_atom* argv){
-    float v;
-    if(sel==gensym("Modal_gain") && get1f(argc,argv,&v)){ x->g_modal_gain=v; return; }
-    if(sel==gensym("Waveguide_gain") && get1f(argc,argv,&v)){ x->g_wg_gain=v; return; }
-    if(sel==gensym("Waveguide_excitation_crossfader") && get1f(argc,argv,&v)){ x->g_wg_xfade=jps_clamp(v,-1.f,1.f); return; }
-}
-
-static void modal_render(t_jps* x, int n){
-    // sums
-    memset(x->modal_sumL, 0, n*sizeof(float));
-    memset(x->modal_sumR, 0, n*sizeof(float));
-    // per-voice feeds
-    for(int v=0; v<JPS_VOICES; ++v){
-        memset(x->mod_vL[v], 0, n*sizeof(float));
-        memset(x->mod_vR[v], 0, n*sizeof(float));
-    }
-    jps_modal* m=&x->modal;
-    int modes = m->modes; if(modes<1)modes=1; if(modes>JPS_MODAL_MAXMODES)modes=JPS_MODAL_MAXMODES;
-    float sr=(float)x->sr;
-
-    for(int v=0; v<JPS_VOICES; ++v){
-        float base = fmaxf(20.f, x->V[v].f0);
-        float vel  = jps_clamp01(x->V[v].vel);
-        int gate   = (x->V[v].state==JPS_HELD);
-        for(int k=0;k<modes;k++){
-            float freq = base * fmaxf(0.0001f, m->ratio[k]);
-            float g    = jps_clamp01(m->gain[k]);
-            float pan  = jps_clamp(m->pan[k], -1.f, 1.f);
-            float atkS = fmaxf(1.f, m->attack[k]*0.001f*sr);
-            float decS = fmaxf(1.f, m->decay[k]*0.001f*sr) * (1.f + 2.f*jps_clamp01(m->damper));
-            float a    = gate? expf(-1.f/atkS) : expf(-1.f/decS);
-            for(int i=0;i<n;i++){
-                // env
-                m->env[v][k] = (1.f-a)*(gate?1.f:0.f) + a*m->env[v][k];
-                // osc
-                m->ph[v][k] += freq/sr; if(m->ph[v][k]>=1.f) m->ph[v][k]-=1.f;
-                float s = sinf(2.f*M_PI*m->ph[v][k]) * m->env[v][k] * g * vel;
-                // brightness tilt
-                float tilt = 1.f + 0.5f*jps_clamp01(m->brightness) * ((float)k/(float)modes);
-                s *= tilt;
-                float L = s * (0.5f*(1.f - pan));
-                float R = s * (0.5f*(1.f + pan));
-                x->mod_vL[v][i] += L;
-                x->mod_vR[v][i] += R;
-            }
-        }
-        for(int i=0;i<n;i++){ x->modal_sumL[i]+=x->mod_vL[v][i]; x->modal_sumR[i]+=x->mod_vR[v][i]; }
+    // We try a few common grammars the banks expose.
+    if (argc==2){ // midi, vel
+        juicy_bank_tilde_note_midi(&x->modal, atom_getfloat(argv+0), atom_getfloat(argv+1));
+        // WG voice assign: push to voice 0..3 in round-robin by their internal jb/jw helper; if not present, we set active_idx=0 and update that voice:
+        // Minimal: set f0 via modal's v[].f0 so WG reads the same pitch from ratio math; we keep WG purely exciter-driven here.
+    } else if (argc==3){ // voice, midi, vel
+        int v = (int)atom_getfloat(argv+0); if (v<0) v=0; if (v>=VOICES) v=VOICES-1;
+        float midi = atom_getfloat(argv+1), vel = atom_getfloat(argv+2);
+        // Modal per-voice on/off via jb_note_on with f0 from midi and set target voice
+        jb_note_on_voice(&x->modal, v, jb_midi_to_hz(midi), vel);
+        // Mirror minimal state into WG voice energy gate
+        x->wg.V[v].active = (vel>0.f)?1:0;
     }
 }
 
-static void wg_prepare_voice(t_jps* x, int v){
-    float sr = (float)x->sr;
-    float f0 = fmaxf(30.f, x->V[v].f0);
-    int need = (int)fmaxf(JPS_MIN_BLOCK, sr/f0 * fmaxf(0.5f, x->wg.ratio));
-    if(need< JPS_MIN_BLOCK) need = JPS_MIN_BLOCK;
-    if(x->wg.size[v] != need || x->wg.bufL[v]==NULL || x->wg.bufR[v]==NULL){
-        free(x->wg.bufL[v]); free(x->wg.bufR[v]);
-        x->wg.bufL[v]=(float*)calloc(need, sizeof(float));
-        x->wg.bufR[v]=(float*)calloc(need, sizeof(float));
-        x->wg.size[v]=need;
-        x->wg.wpos[v]=0;
-        x->wg.hpL[v].z=x->wg.hpR[v].z=x->wg.lpL[v].z=x->wg.lpR[v].z=0.f;
-        x->wg.apL[v].z=x->wg.apR[v].z=0.f;
-    }
-}
-
-static void wg_render(t_jps* x, int n){
-    memset(x->wg_sumL,0,n*sizeof(float));
-    memset(x->wg_sumR,0,n*sizeof(float));
-
-    float sr=(float)x->sr;
-    float a_hp = onepole_a_from_hz(jps_clamp01(x->wg.HP)*sr*0.5f, sr);
-    float a_lp = onepole_a_from_hz(jps_clamp01(x->wg.LP)*sr*0.5f, sr);
-    float disp = jps_clamp(x->wg.dispersion, -0.95f, 0.95f);
-    float pol  = (x->wg.polarity>=0.f)?+1.f:-1.f;
-    float fb   = 0.5f + 0.5f*jps_clamp01(x->wg.decay);   // 0.5..1.0
-    float rels = 0.5f + 0.5f*jps_clamp01(x->wg.release); // 0.5..1.0
-
-    float t = 0.5f*(x->g_wg_xfade+1.f);
-    float w_ext = jps_cospow_w(t);
-    float w_mod = jps_cospow_u(t);
-
-    for(int v=0; v<JPS_VOICES; ++v){
-        wg_prepare_voice(x,v);
-        int sz = x->wg.size[v];
-        float *bufL=x->wg.bufL[v], *bufR=x->wg.bufR[v];
-        int *wp=&x->wg.wpos[v];
-
-        for(int i=0;i<n;i++){
-            float extL = (x->V[v].state==JPS_HELD) ? (float)x->excL[v][i] : 0.f;
-            float extR = (x->V[v].state==JPS_HELD) ? (float)x->excR[v][i] : 0.f;
-            float modL = x->mod_vL[v][i];
-            float modR = x->mod_vR[v][i];
-            float inL = jps_safenan(w_ext*extL + w_mod*modL);
-            float inR = jps_safenan(w_ext*extR + w_mod*modR);
-
-            int rp = (*wp); if(rp<0) rp=0; if(rp>=sz) rp=0;
-            float yL = bufL[rp];
-            float yR = bufR[rp];
-
-            float shapedL = waveshape(yL + inL*(1.f + 2.f*x->wg.push), x->wg.drive, x->wg.symmetry);
-            float shapedR = waveshape(yR + inR*(1.f + 2.f*x->wg.push), x->wg.drive, x->wg.symmetry);
-
-            yL = onepole_hp(shapedL, &x->wg.hpL[v], a_hp);
-            yR = onepole_hp(shapedR, &x->wg.hpR[v], a_hp);
-            yL = onepole_lp(yL, &x->wg.lpL[v], a_lp);
-            yR = onepole_lp(yR, &x->wg.lpR[v], a_lp);
-
-            yL = allpass_tick(yL, &x->wg.apL[v], disp);
-            yR = allpass_tick(yR, &x->wg.apR[v], disp);
-
-            float fbL = pol * yL * fb;
-            float fbR = pol * yR * fb;
-            if(x->V[v].state!=JPS_HELD){ fbL *= rels; fbR *= rels; }
-
-            bufL[*wp] = jps_safenan(fbL);
-            bufR[*wp] = jps_safenan(fbR);
-            (*wp)++; if(*wp>=sz) *wp=0;
-
-            float p=jps_clamp01(x->wg.position);
-            float tapL = yL*(1.f-p) + yR*(p*0.5f);
-            float tapR = yR*(1.f-p) + yL*(p*0.5f);
-
-            x->wg_sumL[i] += tapL * x->wg.gain;
-            x->wg_sumR[i] += tapR * x->wg.gain;
-        }
-    }
-}
+// -------------------------------
+// Perform
+// -------------------------------
 
 static t_int *jps_perform(t_int *w){
-    t_jps *x = (t_jps *)(w[1]);
-    int arg=2;
-    for(int v=0; v<JPS_VOICES; ++v){ x->excL[v]=(t_sample*)(w[arg++]); x->excR[v]=(t_sample*)(w[arg++]); }
-    t_sample *outL=(t_sample*)(w[arg++]);
-    t_sample *outR=(t_sample*)(w[arg++]);
-    int n=(int)(w[arg++]);
+    t_jps   *x  = (t_jps *)(w[1]);
+    // exciter per-voice per-side inlets
+    t_float *v1L = (t_float *)(w[2]);
+    t_float *v1R = (t_float *)(w[3]);
+    t_float *v2L = (t_float *)(w[4]);
+    t_float *v2R = (t_float *)(w[5]);
+    t_float *v3L = (t_float *)(w[6]);
+    t_float *v3R = (t_float *)(w[7]);
+    t_float *v4L = (t_float *)(w[8]);
+    t_float *v4R = (t_float *)(w[9]);
+    t_float *outL= (t_float *)(w[10]);
+    t_float *outR= (t_float *)(w[11]);
+    int       n  = (int)(w[12]);
 
-    if(n<JPS_MIN_BLOCK) n=JPS_MIN_BLOCK; // defensive
+    // 1) Ensure buffers
+    jps_ensure_buffers(x, n);
 
-    // defensive alloc if dsp() wasn't called (host quirk)
-    if(!x->modal_sumL || !x->modal_sumR || !x->wg_sumL || !x->wg_sumR){
-        x->modal_sumL=(float*)calloc(n,sizeof(float));
-        x->modal_sumR=(float*)calloc(n,sizeof(float));
-        x->wg_sumL   =(float*)calloc(n,sizeof(float));
-        x->wg_sumR   =(float*)calloc(n,sizeof(float));
-        for(int v=0; v<JPS_VOICES; ++v){
-            x->mod_vL[v]=(float*)calloc(n,sizeof(float));
-            x->mod_vR[v]=(float*)calloc(n,sizeof(float));
-        }
-    }
+    // 2) Run MODAL engine (inputs: zero main inL/inR, plus 8 per-voice exciter lanes)
+    t_int argvM[2 + 12 + 1];
+    int a=0;
+    argvM[a++] = (t_int)(&x->modal);
+    argvM[a++] = (t_int)(x->zilch);
+    argvM[a++] = (t_int)(x->zilch);
+    argvM[a++] = (t_int)(v1L);
+    argvM[a++] = (t_int)(v1R);
+    argvM[a++] = (t_int)(v2L);
+    argvM[a++] = (t_int)(v2R);
+    argvM[a++] = (t_int)(v3L);
+    argvM[a++] = (t_int)(v3R);
+    argvM[a++] = (t_int)(v4L);
+    argvM[a++] = (t_int)(v4R);
+    argvM[a++] = (t_int)(x->modalL);
+    argvM[a++] = (t_int)(x->modalR);
+    argvM[a++] = (t_int)(n);
+    juicy_bank_tilde_perform(argvM);
 
-    modal_render(x, n);
-    wg_render(x, n);
+    // 3) Build WG inputs by crossfading External Exciter vs Modal stereo
+    float gExt, gMod; jps_cf_gains(x->cf, &gExt, &gMod);
+    // Quick voice gates from modal state
+    int gV[VOICES]; for(int v=0; v<VOICES; ++v){ gV[v] = (x->modal.v[v].state != V_IDLE); }
 
-    float gM=x->g_modal_gain, gW=x->g_wg_gain;
+    // Build 8 input buffers for WG in the expected order
+    // sL[0..3] == v1..v4 left, sR[0..3] == v1..v4 right
+    t_float *sL_in[VOICES] = { v1L, v2L, v3L, v4L };
+    t_float *sR_in[VOICES] = { v1R, v2R, v3R, v4R };
+
+    // temporary stack arrays for mixed inputs (we reuse modalL/R to avoid extra alloc if safe)
+    // but to avoid overwriting, allocate local automatic buffers.
+    t_float mixL1[n], mixR1[n], mixL2[n], mixR2[n];
+
     for(int i=0;i<n;i++){
-        float L = jps_safenan(gM*x->modal_sumL[i] + gW*x->wg_sumL[i]);
-        float R = jps_safenan(gM*x->modal_sumR[i] + gW*x->wg_sumR[i]);
-        outL[i]=L; outR[i]=R;
+        float mL = x->modalL[i];
+        float mR = x->modalR[i];
+        // precompute per-voice mixed signals
+        mixL1[i] = gExt * v1L[i] + gMod * mL;
+        mixR1[i] = gExt * v1R[i] + gMod * mR;
+        mixL2[i] = gExt * v2L[i] + gMod * mL;
+        mixR2[i] = gExt * v2R[i] + gMod * mR;
+        // voice 3/4 done directly later to save a couple lines
     }
-    return (w + 2 + JPS_SIG_INLETS + 3);
+
+    // 4) Run WG engine by invoking its perform() with our eight inputs
+    t_float w_v3L[n], w_v3R[n], w_v4L[n], w_v4R[n];
+    for(int i=0;i<n;i++){
+        float mL = x->modalL[i], mR = x->modalR[i];
+        w_v3L[i] = gExt * v3L[i] + gMod * mL;
+        w_v3R[i] = gExt * v3R[i] + gMod * mR;
+        w_v4L[i] = gExt * v4L[i] + gMod * mL;
+        w_v4R[i] = gExt * v4R[i] + gMod * mR;
+        // apply simple voice gate
+        if(!gV[0]){ mixL1[i]=0.f; mixR1[i]=0.f; }
+        if(!gV[1]){ mixL2[i]=0.f; mixR2[i]=0.f; }
+        if(!gV[2]){ w_v3L[i]=0.f; w_v3R[i]=0.f; }
+        if(!gV[3]){ w_v4L[i]=0.f; w_v4R[i]=0.f; }
+    }
+
+    t_int argvW[2 + 12 + 1];
+    int b=0;
+    argvW[b++] = (t_int)(&x->wg);
+    // order: v1L, v1R, v2L, v2R, v3L, v3R, v4L, v4R, outL, outR, n
+    argvW[b++] = (t_int)(mixL1);
+    argvW[b++] = (t_int)(mixR1);
+    argvW[b++] = (t_int)(mixL2);
+    argvW[b++] = (t_int)(mixR2);
+    argvW[b++] = (t_int)(w_v3L);
+    argvW[b++] = (t_int)(w_v3R);
+    argvW[b++] = (t_int)(w_v4L);
+    argvW[b++] = (t_int)(w_v4R);
+    argvW[b++] = (t_int)(x->wgL);
+    argvW[b++] = (t_int)(x->wgR);
+    argvW[b++] = (t_int)(n);
+    wg_bank_perform(argvW);
+
+    // 5) Final mix
+    float mg = x->modal_gain, wg = x->wg_gain;
+    for(int i=0;i<n;i++){
+        outL[i] = wg * x->wgL[i] + mg * x->modalL[i];
+        outR[i] = wg * x->wgR[i] + mg * x->modalR[i];
+    }
+    return w + 13;
 }
 
 static void jps_dsp(t_jps *x, t_signal **sp){
-    x->sr=(int)sp[0]->s_sr;
-    int n=sp[0]->s_n; if(n<JPS_MIN_BLOCK) n=JPS_MIN_BLOCK;
+    int n = sp[0]->s_n;
+    jps_ensure_buffers(x, n);
+    x->modal.sr = sp[0]->s_sr;
+    x->wg.sr    = sp[0]->s_sr;
+    x->wg.bs    = n;
+    x->wg.k_smooth = 1.f - expf(-1.f/(0.01f * x->wg.sr)); // ~10ms smoothing
 
-    // (re)alloc per-block buffers
-    free(x->modal_sumL); free(x->modal_sumR); free(x->wg_sumL); free(x->wg_sumR);
-    x->modal_sumL=(float*)calloc(n,sizeof(float));
-    x->modal_sumR=(float*)calloc(n,sizeof(float));
-    x->wg_sumL   =(float*)calloc(n,sizeof(float));
-    x->wg_sumR   =(float*)calloc(n,sizeof(float));
-    for(int v=0; v<JPS_VOICES; ++v){
-        free(x->mod_vL[v]); free(x->mod_vR[v]);
-        x->mod_vL[v]=(float*)calloc(n,sizeof(float));
-        x->mod_vR[v]=(float*)calloc(n,sizeof(float));
-    }
-
-    int argc = 2 + JPS_SIG_INLETS + 3;
-    t_int *vec = (t_int *)getbytes(argc * sizeof(t_int));
-    int k=0; vec[k++]=(t_int)x;
-    for(int v=0; v<JPS_VOICES; ++v){ vec[k++]=(t_int)sp[2*v]->s_vec; vec[k++]=(t_int)sp[2*v+1]->s_vec; }
-    vec[k++]=(t_int)sp[JPS_SIG_INLETS]->s_vec;
-    vec[k++]=(t_int)sp[JPS_SIG_INLETS+1]->s_vec;
-    vec[k++]=(t_int)n;
-    dsp_addv(jps_perform, argc, vec);
-    freebytes(vec, argc*sizeof(t_int));
+    t_int argv[2 + 10 + 1];
+    int a=0;
+    argv[a++] = (t_int)x;
+    // 8 inputs
+    for(int i=0;i<8;i++) argv[a++] = (t_int)(sp[i]->s_vec);
+    // 2 outs
+    argv[a++] = (t_int)(sp[8]->s_vec);
+    argv[a++] = (t_int)(sp[9]->s_vec);
+    argv[a++] = (t_int)(n);
+    dsp_addv(jps_perform, a, argv);
 }
+
+// -------------------------------
+// Message plumbing
+// -------------------------------
+
+static void jps_anything(t_jps *x, t_symbol *s, int argc, t_atom *argv){
+    (void)argc;
+    if (s==gensym("Modal_gain") || s==gensym("Waveguide_gain") || s==gensym("Waveguide_excitation_crossfader")){
+        if (argc>0) jps_global_param(x, s, atom_getfloat(argv));
+        return;
+    }
+    // Fallback: treat symbol as modal or waveguide param depending on which inlet the float came to.
+    // We expose separate inlets via "float" proxies that set x->which_* before calling here.
+}
+
+static void jps_float_modal(t_jps *x, t_floatarg f){
+    // symbol must arrive first; but Pd sends float only — so we keep last-tag heuristic.
+    // Users should send "symbol value" via [pack s f] for reliability.
+    if (!x->which_modal) x->which_modal = gensym("gain");
+    jps_modal_param(x, x->which_modal, f);
+}
+static void jps_selector_modal(t_jps *x, t_symbol *s){ x->which_modal = s; }
+
+static void jps_float_wg(t_jps *x, t_floatarg f){
+    if (!x->which_wg) x->which_wg = gensym("gain");
+    jps_wg_param(x, x->which_wg, f);
+}
+static void jps_selector_wg(t_jps *x, t_symbol *s){ x->which_wg = s; }
+
+static void jps_float_global(t_jps *x, t_floatarg f){
+    if (!x->which_glob) x->which_glob = gensym("Waveguide_excitation_crossfader");
+    jps_global_param(x, x->which_glob, f);
+}
+static void jps_selector_global(t_jps *x, t_symbol *s){ x->which_glob = s; }
+
+// -------------------------------
+// New / Free
+// -------------------------------
+
 
 static void *jps_new(void){
-    t_jps *x=(t_jps*)pd_new(jps_class);
-    for(int i=0;i<JPS_SIG_INLETS;i++) inlet_new(&x->x_obj,&x->x_obj.ob_pd,gensym("signal"),gensym("signal"));
+    t_jps *x = (t_jps *)pd_new(jps_class);
 
-    // proxies
-    jps_proxy_class = jps_proxy_class; // silence unused warning
-    x->proxy_modal  = (t_jps_proxy*)pd_new(jps_proxy_class); x->proxy_modal->owner=x; x->proxy_modal->which=1;
-    x->proxy_wg     = (t_jps_proxy*)pd_new(jps_proxy_class); x->proxy_wg->owner=x; x->proxy_wg->which=2;
-    x->proxy_global = (t_jps_proxy*)pd_new(jps_proxy_class); x->proxy_global->owner=x; x->proxy_global->which=3;
-    inlet_new(&x->x_obj,&x->proxy_modal->p_obj.ob_pd,&s_anything,&s_anything);
-    inlet_new(&x->x_obj,&x->proxy_wg->p_obj.ob_pd,&s_anything,&s_anything);
-    inlet_new(&x->x_obj,&x->proxy_global->p_obj.ob_pd,&s_anything,&s_anything);
+    x->modal_gain = 0.5f;
+    x->wg_gain    = 0.5f;
+    x->cf         = -1.f; // start purely external exciter→WG
+    x->bs_cached  = 0;
+    x->zilch = x->modalL = x->modalR = x->wgL = x->wgR = NULL;
+    x->which_modal = x->which_wg = x->which_glob = NULL;
 
-    x->outL=outlet_new(&x->x_obj,gensym("signal"));
-    x->outR=outlet_new(&x->x_obj,gensym("signal"));
-
-    for(int v=0; v<JPS_VOICES; ++v){ x->V[v].state=JPS_IDLE; x->V[v].f0=110.f; x->V[v].vel=0.f; }
-
-    modal_init(&x->modal);
-    wg_init(&x->wg);
-
-    x->g_modal_gain=1.f; x->g_wg_gain=1.f; x->g_wg_xfade=-1.f;
-
-    // non-null small buffers
-    int n=JPS_MIN_BLOCK;
-    x->modal_sumL=(float*)calloc(n,sizeof(float));
-    x->modal_sumR=(float*)calloc(n,sizeof(float));
-    x->wg_sumL   =(float*)calloc(n,sizeof(float));
-    x->wg_sumR   =(float*)calloc(n,sizeof(float));
-    x->mod_vL = (float**)calloc(JPS_VOICES,sizeof(float*));
-    x->mod_vR = (float**)calloc(JPS_VOICES,sizeof(float*));
-    for(int v=0; v<JPS_VOICES; ++v){
-        x->mod_vL[v]=(float*)calloc(n,sizeof(float));
-        x->mod_vR[v]=(float*)calloc(n,sizeof(float));
+    // Init modal defaults (scratch: one resonator audible at x1, etc.)
+    x->modal.sr = sys_getsr(); if (x->modal.sr<=0) x->modal.sr = 48000;
+    x->modal.n_modes=20; x->modal.edit_idx=0; x->modal.max_voices = JB_MAX_VOICES;
+    for(int i=0;i<JB_MAX_MODES;i++){
+        x->modal.base[i].active=(i<20);
+        x->modal.base[i].base_ratio=(float)(i+1);
+        x->modal.base[i].base_decay_ms=500.f;
+        x->modal.base[i].base_gain= (i==0)? 0.5f : 0.0f; // only first resonator audible by default
+        x->modal.base[i].attack_ms=0.f;
+        x->modal.base[i].curve_amt=0.f;
+        x->modal.base[i].pan=(i==0)?0.f:((i&1)?-0.2f:0.2f);
+        x->modal.base[i].keytrack=1;
+        x->modal.base[i].disp_signature=0.f;
+        x->modal.base[i].micro_sig=0.f;
     }
-    return x;
+    x->modal.basef0_ref = 261.626f;
+    x->modal.damping=0.f; x->modal.brightness=0.5f; x->modal.position=0.f;
+    x->modal.density_amt=0.f; x->modal.density_mode=DENSITY_PIVOT;
+    x->modal.dispersion=0.f; x->modal.dispersion_last=-1.f;
+    x->modal.aniso=0.f; x->modal.aniso_eps=0.02f;
+    x->modal.contact_amt=0.f; x->modal.contact_sym=0.f;
+    x->modal.phase_rand=1.f; x->modal.phase_debug=0;
+    x->modal.bandwidth=0.1f; x->modal.micro_detune=0.1f;
+    for(int v=0; v<JB_MAX_VOICES; ++v){
+        x->modal.v[v].state=V_IDLE; x->modal.v[v].f0=x->modal.basef0_ref; x->modal.v[v].vel=0.f; x->modal.v[v].energy=0.f;
+        for(int i=0;i<JB_MAX_MODES;i++){ x->modal.v[v].disp_offset[i]=x->modal.v[v].disp_target[i]=0.f; x->modal.v[v].cr_gain_mul[i]=x->modal.v[v].cr_decay_mul[i]=1.f; }
+    }
+    x->modal.hp_a=0.f; x->modal.hpL_x1=x->modal.hpL_y1=x->modal.hpR_x1=x->modal.hpR_y1=0.f;
+    x->modal.exciter_mode = 1; // per-voice 8-in
+
+    // Init WG defaults (string, x1 ratio, max gain, plus polarity)
+    memset(&x->wg, 0, sizeof(t_wg_bank));
+    x->wg.sr = sys_getsr(); if (x->wg.sr<=0) x->wg.sr = 48000;
+    x->wg.bs = 64; // will be replaced in dsp()
+    x->wg.topo = TOPO_STRING;
+    x->wg.v_gain = x->wg.gain = 1.f;
+    x->wg.v_ratio = x->wg.ratio = 1.f;
+    x->wg.v_index = x->wg.index = 1.f;
+    x->wg.v_decay = x->wg.decay = 1.f;
+    x->wg.v_release = x->wg.release = 1.f;
+    x->wg.v_hp = x->wg.hp = 0.f;
+    x->wg.v_lp = x->wg.lp = 1.f;
+    x->wg.active_idx = 0;
+    for(int v=0; v<VOICES; ++v){
+        x->wg.V[v].active = 0;
+        for(int l=0; l<WG_LINES; ++l){
+            x->wg.V[v].L[l].keytrack_on = 1;
+            x->wg.V[v].L[l].polarity_plus = 1;
+        }
+    }
+
+    // Add the remaining 7 signal inlets (leftmost is implicit via CLASS_MAINSIGNALIN)
+    for (int i=0;i<7;i++) inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_signal, &s_signal);
+
+    // Signal outlets
+    x->outL = outlet_new(&x->x_obj, &s_signal);
+    x->outR = outlet_new(&x->x_obj, &s_signal);
+
+    // Float/message inlets (3 float proxies + one list inlet)
+    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_symbol, gensym("modal_select"));
+    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_float,  gensym("modal"));
+    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_symbol, gensym("wg_select"));
+    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_float,  gensym("wg"));
+    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_symbol, gensym("global_select"));
+    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_float,  gensym("global"));
+    inlet_new(&x->x_obj, &x->x_obj.ob_pd, &s_list,   gensym("list")); // poly midi list
+
+    return (void*)x;
 }
+}
+
 static void jps_free(t_jps *x){
-    for(int i=0;i<JPS_SIG_INLETS;i++){}
-    if(x->outL) outlet_free(x->outL);
-    if(x->outR) outlet_free(x->outR);
-    if(x->proxy_modal) pd_free(&x->proxy_modal->p_obj);
-    if(x->proxy_wg)    pd_free(&x->proxy_wg->p_obj);
-    if(x->proxy_global)pd_free(&x->proxy_global->p_obj);
-    free(x->modal_sumL); free(x->modal_sumR); free(x->wg_sumL); free(x->wg_sumR);
-    for(int v=0; v<JPS_VOICES; ++v){
-        free(x->mod_vL[v]); free(x->mod_vR[v]);
-        free(x->wg.bufL[v]); free(x->wg.bufR[v]);
-    }
-    free(x->mod_vL); free(x->mod_vR);
-    free(x->wg.bufL); free(x->wg.bufR);
-    free(x->wg.size); free(x->wg.wpos);
-    free(x->wg.hpL); free(x->wg.hpR); free(x->wg.lpL); free(x->wg.lpR);
-    free(x->wg.apL); free(x->wg.apR);
+    if (x->zilch){ freebytes(x->zilch,  x->bs_cached*sizeof(t_float)); }
+    if (x->modalL){ freebytes(x->modalL, x->bs_cached*sizeof(t_float)); }
+    if (x->modalR){ freebytes(x->modalR, x->bs_cached*sizeof(t_float)); }
+    if (x->wgL){ freebytes(x->wgL, x->bs_cached*sizeof(t_float)); }
+    if (x->wgR){ freebytes(x->wgR, x->bs_cached*sizeof(t_float)); }
 }
 
-static void jps_proxy_anything(t_jps_proxy* p, t_symbol* s, int argc, t_atom* argv){
-    t_jps *x=p->owner;
-    if(p->which==1){ jps_modal_msg(x,s,argc,argv); return; }
-    if(p->which==2){ jps_wg_msg(x,s,argc,argv); return; }
-    if(p->which==3){ jps_global_msg(x,s,argc,argv); return; }
-}
+// -------------------------------
+// Setup
+// -------------------------------
+
 
 void juicy_physical_synth_tilde_setup(void){
     jps_class = class_new(gensym("juicy_physical_synth~"),
                           (t_newmethod)jps_new,
                           (t_method)jps_free,
-                          sizeof(t_jps), CLASS_DEFAULT, 0);
-    class_addlist(jps_class, (t_method)jps_list);
-    class_addmethod(jps_class, (t_method)jps_dsp, gensym("dsp"), A_CANT, 0);
+                          sizeof(t_jps),
+                          CLASS_DEFAULT, 0);
 
-    jps_proxy_class = class_new(gensym("_jps_proxy"),
-                                0, 0, sizeof(t_jps_proxy), CLASS_NOINLET, 0);
-    class_addanything(jps_proxy_class, (t_method)jps_proxy_anything);
+    class_addmethod(jps_class, (t_method)jps_dsp, gensym("dsp"), A_CANT, 0);
+    CLASS_MAINSIGNALIN(jps_class, t_jps, cf); // leftmost signal is implicit; we reuse cf as storage
+
+    // Param selectors (choose which param the next float targets)
+    class_addmethod(jps_class, (t_method)jps_selector_modal,  gensym("modal_select"),  A_SYMBOL, 0);
+    class_addmethod(jps_class, (t_method)jps_selector_wg,     gensym("wg_select"),     A_SYMBOL, 0);
+    class_addmethod(jps_class, (t_method)jps_selector_global, gensym("global_select"), A_SYMBOL, 0);
+
+    // Float messages routed to namespaces
+    class_addmethod(jps_class, (t_method)jps_float_modal,  gensym("modal"),  A_DEFFLOAT, 0);
+    class_addmethod(jps_class, (t_method)jps_float_wg,     gensym("wg"),     A_DEFFLOAT, 0);
+    class_addmethod(jps_class, (t_method)jps_float_global, gensym("global"), A_DEFFLOAT, 0);
+
+    // Poly list
+    class_addlist(jps_class, (t_method)jps_list);
+
+    // anything fallback
+    class_addanything(jps_class, (t_method)jps_anything);
 }
+
